@@ -1,0 +1,179 @@
+stages:
+  - build
+
+variables:
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+
+.docker-build-template: &docker-build-template
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  before_script:
+    - apk add --no-cache bash git
+    - docker info
+
+build-image:
+  <<: *docker-build-template
+  stage: build
+  when: manual
+  variables:
+    IMAGE_NAME:
+      value: ""
+      description: "Name of the image to build (must match a directory name in the repo)"
+    VERSION_BUMP:
+      value: "none"
+      description: "Version bump type: none, patch, minor, or major"
+      options:
+        - "none"
+        - "patch"
+        - "minor"
+        - "major"
+    BUILD_ARGS:
+      value: ""
+      description: "Additional build arguments (comma-separated: KEY1=val1,KEY2=val2)"
+  script:
+    - |
+      set -e
+
+      # Validate required variables
+      if [ -z "$IMAGE_NAME" ]; then
+        echo "ERROR: IMAGE_NAME is required"
+        exit 1
+      fi
+
+      if [ -z "$HARBOR_REGISTRY" ]; then
+        echo "ERROR: HARBOR_REGISTRY CI/CD variable is not set"
+        exit 1
+      fi
+
+      if [ -z "$HARBOR_PROJECT" ]; then
+        echo "ERROR: HARBOR_PROJECT CI/CD variable is not set"
+        exit 1
+      fi
+
+      # Validate image directory exists
+      if [ ! -d "$IMAGE_NAME" ]; then
+        echo "ERROR: Directory '$IMAGE_NAME' does not exist"
+        exit 1
+      fi
+
+      if [ ! -f "$IMAGE_NAME/Dockerfile" ]; then
+        echo "ERROR: Dockerfile not found at '$IMAGE_NAME/Dockerfile'"
+        exit 1
+      fi
+
+      # Read current version
+      VERSION_FILE="$IMAGE_NAME/VERSION"
+      if [ ! -f "$VERSION_FILE" ]; then
+        echo "ERROR: VERSION file not found at '$VERSION_FILE'"
+        exit 1
+      fi
+
+      CURRENT_VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+      echo "Current version: $CURRENT_VERSION"
+
+      # Parse semantic version
+      MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+      MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+      PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
+
+      # Bump version if requested
+      case "$VERSION_BUMP" in
+        "patch")
+          PATCH=$((PATCH + 1))
+          ;;
+        "minor")
+          MINOR=$((MINOR + 1))
+          PATCH=0
+          ;;
+        "major")
+          MAJOR=$((MAJOR + 1))
+          MINOR=0
+          PATCH=0
+          ;;
+        "none")
+          ;;
+        *)
+          echo "ERROR: Invalid VERSION_BUMP value: $VERSION_BUMP"
+          exit 1
+          ;;
+      esac
+
+      NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+      echo "Building version: $NEW_VERSION"
+
+      # Construct image tags
+      IMAGE_BASE="$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME"
+      TAG_VERSION="$IMAGE_BASE:$NEW_VERSION"
+      TAG_LATEST="$IMAGE_BASE:latest"
+      TAG_SHA="$IMAGE_BASE:${CI_COMMIT_SHORT_SHA}"
+
+      echo "Image tags:"
+      echo "  - $TAG_VERSION"
+      echo "  - $TAG_LATEST"
+      echo "  - $TAG_SHA"
+
+      # Parse build arguments
+      BUILD_ARGS_FLAGS=""
+      if [ -n "$BUILD_ARGS" ]; then
+        echo "Processing build arguments..."
+        # Convert comma-separated args to --build-arg flags
+        IFS=',' read -ra ARGS_ARRAY <<< "$BUILD_ARGS"
+        for arg in "${ARGS_ARRAY[@]}"; do
+          if [ -n "$arg" ]; then
+            BUILD_ARGS_FLAGS="$BUILD_ARGS_FLAGS --build-arg $arg"
+            echo "  - $arg"
+          fi
+        done
+      fi
+
+      # Login to Harbor
+      echo "Logging into Harbor registry..."
+      echo "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" -u "$HARBOR_USERNAME" --password-stdin
+
+      # Build the image
+      echo "Building Docker image..."
+      docker build \
+        $BUILD_ARGS_FLAGS \
+        --tag "$TAG_VERSION" \
+        --tag "$TAG_LATEST" \
+        --tag "$TAG_SHA" \
+        --file "$IMAGE_NAME/Dockerfile" \
+        "$IMAGE_NAME"
+
+      # Push all tags
+      echo "Pushing images to Harbor..."
+      docker push "$TAG_VERSION"
+      docker push "$TAG_LATEST"
+      docker push "$TAG_SHA"
+
+      echo "Successfully pushed all image tags!"
+
+      # Update VERSION file if version was bumped
+      if [ "$VERSION_BUMP" != "none" ]; then
+        echo "Updating VERSION file..."
+        echo "$NEW_VERSION" > "$VERSION_FILE"
+
+        # Configure git for commit
+        git config user.email "gitlab-ci@${CI_SERVER_HOST}"
+        git config user.name "GitLab CI"
+
+        # Commit and push version update
+        git add "$VERSION_FILE"
+        git commit -m "chore($IMAGE_NAME): bump version to $NEW_VERSION [skip ci]"
+
+        # Push to the source branch
+        git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:${CI_COMMIT_REF_NAME}
+
+        echo "VERSION file updated and pushed"
+      fi
+
+      echo ""
+      echo "=========================================="
+      echo "Build completed successfully!"
+      echo "Image: $IMAGE_NAME"
+      echo "Version: $NEW_VERSION"
+      echo "=========================================="
